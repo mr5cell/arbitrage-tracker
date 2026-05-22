@@ -55,8 +55,8 @@ const PORT = process.env.PORT || 3000;
 console.log(`🔧 Using PORT: ${PORT}`);
 
 const corsOptions = {
-  origin: process.env.NODE_ENV === 'production' 
-    ? [process.env.FRONTEND_URL, 'https://your-domain.com']
+  origin: process.env.NODE_ENV === 'production'
+    ? [process.env.FRONTEND_URL].filter(Boolean)
     : ['http://localhost:3000', 'http://127.0.0.1:3000'],
   credentials: true
 };
@@ -200,6 +200,41 @@ let chargesCache = {
   timestamp: {}     // Track when each was last updated
 };
 
+function cacheChargesFromResponse(response, cacheCategory, cacheKey, equityPrice, futuresPrice, lotSize, { logDetails = false, symbol = '' } = {}) {
+  if (!response || !response.orders || response.orders.length === 0) return null;
+
+  let totalCharge = 0;
+  response.orders.forEach(order => {
+    const c = order.charges || {};
+    const orderCharge = (
+      (c.transaction_tax || 0) +
+      (c.exchange_turnover_charge || 0) +
+      (c.sebi_turnover_charge || 0) +
+      (c.brokerage || 0) +
+      (c.stamp_duty || 0) +
+      (c.gst?.total || c.gst || 0)
+    );
+    totalCharge += orderCharge;
+    if (logDetails) {
+      console.log(`    Order ${order.tradingsymbol}: ₹${orderCharge.toFixed(2)}`);
+    }
+  });
+
+  const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
+  const chargePercent = (totalCharge / totalValue) * 200;
+  const marginRequired = response.final?.total || 0;
+
+  if (logDetails) {
+    console.log(`💰 Charges for ${symbol}: Total=₹${totalCharge.toFixed(2)} (${chargePercent.toFixed(3)}%)`);
+    console.log(`   Lot Size: ${lotSize}, Trade Value: ₹${totalValue.toFixed(2)}`);
+    console.log(`   Margin Required: ₹${marginRequired}`);
+  }
+
+  cacheCategory[cacheKey] = { chargePercent, lotSize, marginRequired };
+  chargesCache.timestamp[cacheKey] = Date.now();
+  return cacheCategory[cacheKey];
+}
+
 // Get actual charges using Kite margins API
 async function getActualCharges(symbol, equityPrice, futuresPrice, futuresSymbol, orderType = 'arbitrage') {
   try {
@@ -272,127 +307,46 @@ async function getActualCharges(symbol, equityPrice, futuresPrice, futuresSymbol
     
     // Get basket margins and charges
     const response = await kite.orderBasketMargins(basket);
-    
-    if (response && response.orders && response.orders.length > 0) {
-      // Calculate total charges from all orders in the response
-      let totalChargeAmount = 0;
-      
-      response.orders.forEach(order => {
-        const orderCharges = order.charges || {};
-        const orderCharge = (
-          (orderCharges.transaction_tax || 0) +
-          (orderCharges.exchange_turnover_charge || 0) + 
-          (orderCharges.sebi_turnover_charge || 0) +
-          (orderCharges.brokerage || 0) +
-          (orderCharges.stamp_duty || 0) +
-          (orderCharges.gst?.total || orderCharges.gst || 0)
-        );
-        totalChargeAmount += orderCharge;
-        
-        console.log(`    Order ${order.tradingsymbol}: ₹${orderCharge.toFixed(2)}`);
-      });
-      
-      const chargeAmount = totalChargeAmount;
-      
-      // Convert to percentage of total value
-      const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
-      const chargePercent = (chargeAmount / totalValue) * 200; // As percentage of one leg
-      
-      console.log(`💰 Charges for ${symbol}: Total=₹${chargeAmount.toFixed(2)} (${chargePercent.toFixed(3)}%)`);
-      console.log(`   Lot Size: ${lotSize}, Trade Value: ₹${totalValue.toFixed(2)}`);
-      console.log(`   Margin Required: ₹${response.final?.total || 0}`);
-      
-      // Cache the result in the appropriate category
-      cacheCategory[cacheKey] = {
-        chargePercent,
-        lotSize,
-        marginRequired: response.final.total || 0
-      };
-      chargesCache.timestamp[cacheKey] = Date.now();
-      
-      return cacheCategory[cacheKey];
-    }
-    
+    const result = cacheChargesFromResponse(response, cacheCategory, cacheKey, equityPrice, futuresPrice, lotSize, { logDetails: true, symbol });
+    if (result) return result;
+
     // Response invalid, retry once after a small delay
     console.log(`⚠️ Invalid response for ${symbol}, retrying...`);
     await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    // Retry the API call
+
     try {
       const retryResponse = await kite.orderBasketMargins(basket);
-      if (retryResponse && retryResponse.orders && retryResponse.orders.length > 0) {
-        let totalChargeAmount = 0;
-        retryResponse.orders.forEach(order => {
-          const orderCharges = order.charges || {};
-          totalChargeAmount += (
-            (orderCharges.transaction_tax || 0) +
-            (orderCharges.exchange_turnover_charge || 0) + 
-            (orderCharges.sebi_turnover_charge || 0) +
-            (orderCharges.brokerage || 0) +
-            (orderCharges.stamp_duty || 0) +
-            (orderCharges.gst?.total || orderCharges.gst || 0)
-          );
-        });
-        const chargeAmount = totalChargeAmount;
-        const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
-        const chargePercent = (chargeAmount / totalValue) * 200;
-        
-        cacheCategory[cacheKey] = {
-          chargePercent,
-          lotSize,
-          marginRequired: retryResponse.final.total || 0
-        };
-        chargesCache.timestamp[cacheKey] = Date.now();
+      const retryResult = cacheChargesFromResponse(retryResponse, cacheCategory, cacheKey, equityPrice, futuresPrice, lotSize);
+      if (retryResult) {
         console.log(`✅ Retry successful for ${symbol}`);
-        return cacheCategory[cacheKey];
+        return retryResult;
       }
     } catch (retryError) {
       console.log(`❌ Retry failed for ${symbol}: ${retryError.message}`);
     }
-    
+
     return null;
-    
+
   } catch (error) {
     console.log(`❌ Charges API error for ${symbol}: ${error.message}`);
-    
+
     // If rate limit error, wait and retry
     if (error.message && error.message.includes('rate')) {
       console.log(`⏳ Rate limited, waiting 2 seconds...`);
       await new Promise(resolve => setTimeout(resolve, 2000));
-      
+
       try {
         const retryResponse = await kite.orderBasketMargins(basket);
-        if (retryResponse && retryResponse.orders && retryResponse.orders.length > 0) {
-          let totalChargeAmount = 0;
-          retryResponse.orders.forEach(order => {
-            const orderCharges = order.charges || {};
-            totalChargeAmount += (
-              (orderCharges.transaction_tax || 0) +
-              (orderCharges.exchange_turnover_charge || 0) + 
-              (orderCharges.sebi_turnover_charge || 0) +
-              (orderCharges.brokerage || 0) +
-              (orderCharges.stamp_duty || 0) +
-              (orderCharges.gst?.total || orderCharges.gst || 0)
-            );
-          });
-          const chargeAmount = totalChargeAmount;
-          const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
-          const chargePercent = (chargeAmount / totalValue) * 200;
-          
-          cacheCategory[cacheKey] = {
-            chargePercent,
-            lotSize,
-            marginRequired: retryResponse.final.total || 0
-          };
-          chargesCache.timestamp[cacheKey] = Date.now();
+        const retryResult = cacheChargesFromResponse(retryResponse, cacheCategory, cacheKey, equityPrice, futuresPrice, lotSize);
+        if (retryResult) {
           console.log(`✅ Retry successful after rate limit for ${symbol}`);
-          return cacheCategory[cacheKey];
+          return retryResult;
         }
       } catch (retryError) {
         console.log(`❌ Retry after rate limit failed: ${retryError.message}`);
       }
     }
-    
+
     return null;
   }
 }
@@ -595,13 +549,7 @@ async function updateArbitrageData() {
       
       const equityPrice = equityTick.last_price;
       const futuresPrice = futureTick.last_price;
-      
-      // Debug first few price differences
-      if (promises.length < 3) {
-        const diff = ((futuresPrice - equityPrice) / equityPrice) * 100;
-        console.log(`${symbol} ${expiry.symbol}: Spot=₹${equityPrice}, Futures=₹${futuresPrice}, Diff=${diff.toFixed(3)}%`);
-      }
-      
+
       // Create async promise for calculating arbitrage with actual charges
       const promise = calculateArbitrage(symbol, equityPrice, futuresPrice, daysToExpiry, futureSymbol)
         .then(arb => {
@@ -647,26 +595,6 @@ async function updateArbitrageData() {
   
   console.log(`Found ${arbitrageData.length} arbitrage and ${reverseArbitrageData.length} reverse arbitrage opportunities`);
   console.log(`Charges cached: ${Object.keys(chargesCache.arbitrage).length} arbitrage, ${Object.keys(chargesCache.reverse).length} reverse`);
-  
-  // Debug: Show some sample price data to understand what we're working with
-  if (arbitrageData.length === 0 && reverseArbitrageData.length === 0) {
-    console.log('\n📊 Debug: Sample price data from quotes:');
-    let sampleCount = 0;
-    for (const [key, tick] of Object.entries(tickData)) {
-      if (sampleCount >= 5) break;
-      if (tick.exchange === 'NSE' && tick.last_price) {
-        const symbol = tick.tradingsymbol;
-        const spotPrice = tick.last_price;
-        
-        // Find corresponding futures
-        const currentFuture = tickData[`NFO:${symbol}26MAYFUT`];
-        if (currentFuture && currentFuture.last_price) {
-          console.log(`${symbol}: Spot=₹${spotPrice}, Futures=₹${currentFuture.last_price}, Diff=${(currentFuture.last_price - spotPrice).toFixed(2)}`);
-          sampleCount++;
-        }
-      }
-    }
-  }
 }
 
 // Fetch quotes via HTTP API
@@ -740,13 +668,7 @@ async function fetchQuotesPeriodically() {
     }
     
     console.log(`✅ Successfully fetched ${Object.keys(quotes).length} quotes out of ${instruments.length} requested`);
-    
-    // Debug: Show first few quotes
-    const sampleKeys = Object.keys(quotes).slice(0, 3);
-    sampleKeys.forEach(key => {
-      console.log(`Quote ${key}: Price=${quotes[key].last_price}, Token=${quotes[key].instrument_token}`);
-    });
-    
+
     // Convert quotes to tick format and store
     Object.keys(quotes).forEach(key => {
       const quote = quotes[key];
@@ -812,26 +734,6 @@ app.get('/api/status', (req, res) => {
     dataPoints: Object.keys(tickData).length,
     isInitialized
   });
-});
-
-// Test endpoint to get quotes directly
-app.get('/api/test-quotes', async (req, res) => {
-  try {
-    if (!kite) {
-      return res.status(500).json({ error: 'Not authenticated' });
-    }
-    
-    // Get quotes for RELIANCE and its futures
-    const instruments = ['NSE:RELIANCE', 'NFO:RELIANCE26NOV26000CE'];
-    const quotes = await kite.getQuote(instruments);
-    
-    res.json({ quotes, tickData: Object.keys(tickData).length });
-  } catch (error) {
-    res.status(500).json({ 
-      error: error.message,
-      data: error.data 
-    });
-  }
 });
 
 app.get('/api/arbitrage/:type/:month', (req, res) => {
