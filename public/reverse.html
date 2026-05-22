@@ -408,6 +408,11 @@
       font-size: 12px;
     }
 
+    .na-cell {
+      color: #9b9b9b;
+      font-style: italic;
+    }
+
     /* Footer */
     .footer {
       margin-top: 60px;
@@ -497,7 +502,7 @@
                 <button class="filter-clear">Clear</button>
               </div>
             </th>
-            <th>SLB fee</th>
+            <th class="sortable" data-column="slbFee">SLB fee</th>
             <th class="sortable" data-column="netReturn">
               <span>Net return</span>
               <span class="filter-icon" data-column="netReturn">⚙</span>
@@ -725,15 +730,19 @@
         }
       });
       
-      // Sort data
+      // Sort data; NA always sinks to the bottom
       filteredData.sort((a, b) => {
         let aVal = a[sortColumn];
         let bVal = b[sortColumn];
-        
-        // Handle numeric values
+        const aNa = aVal === 'NA' || aVal == null;
+        const bNa = bVal === 'NA' || bVal == null;
+        if (aNa && !bNa) return 1;
+        if (!aNa && bNa) return -1;
+        if (aNa && bNa) return 0;
+
         if (!isNaN(parseFloat(aVal))) aVal = parseFloat(aVal);
         if (!isNaN(parseFloat(bVal))) bVal = parseFloat(bVal);
-        
+
         if (sortOrder === 'asc') {
           return aVal > bVal ? 1 : -1;
         } else {
@@ -774,23 +783,29 @@
       table.style.display = 'table';
       empty.style.display = 'none';
       
-      tbody.innerHTML = data.map(item => `
+      tbody.innerHTML = data.map(item => {
+        const slbNa = item.slbFee === 'NA' || item.slbFee == null || item.slbFee === '';
+        const netNa = item.netReturn === 'NA';
+        const slbCell = slbNa ? `<td class="na-cell">NA</td>` : `<td>₹${item.slbFee}</td>`;
+        const netClass = netNa ? 'na-cell' : (parseFloat(item.netReturn) > 0 ? 'positive' : 'negative');
+        const netText = netNa ? 'NA' : `${item.netReturn}%`;
+        const annTitle = item.annualizedReturn === 'NA' ? 'Annualized: NA' : `Annualized: ${item.annualizedReturn}%`;
+        return `
         <tr>
           <td class="symbol">${item.symbol}</td>
           <td>₹${item.equityPrice}</td>
           <td>₹${item.futuresPrice}</td>
           <td class="discount">${Math.abs(item.percentageDiff).toFixed(2)}%</td>
-          <td class="slb-placeholder">${item.slbFee || 'TBD'}</td>
-          <td class="${parseFloat(item.netReturn) > 0 ? 'positive' : 'negative'}" title="Annualized: ${item.annualizedReturn}%">
-            ${item.netReturn}%
-          </td>
+          ${slbCell}
+          <td class="${netClass}" title="${annTitle}">${netText}</td>
           <td>
             <button class="trade-btn" onclick="executeTrade('${item.symbol}', '${item.expiry}')">
               Trade
             </button>
           </td>
         </tr>
-      `).join('');
+      `;
+      }).join('');
       
       // Update last update time
       document.getElementById('last-update').textContent = new Date().toLocaleTimeString();

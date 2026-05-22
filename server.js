@@ -8,6 +8,7 @@ const cors = require('cors');
 const fs = require('fs');
 const { login: kiteLogin, getKite } = require('./kite-auto-auth');
 const timeUtils = require('./utils/timeUtils');
+const slbFetcher = require('./slb/fetcher');
 
 // Initialize environment variables and create config
 function initializeConfig() {
@@ -230,7 +231,7 @@ function cacheChargesFromResponse(response, cacheCategory, cacheKey, equityPrice
     console.log(`   Margin Required: ₹${marginRequired}`);
   }
 
-  cacheCategory[cacheKey] = { chargePercent, lotSize, marginRequired };
+  cacheCategory[cacheKey] = { chargePercent, chargeAmount: totalCharge, lotSize, marginRequired };
   chargesCache.timestamp[cacheKey] = Date.now();
   return cacheCategory[cacheKey];
 }
@@ -352,43 +353,55 @@ async function getActualCharges(symbol, equityPrice, futuresPrice, futuresSymbol
 }
 
 // Calculate arbitrage opportunities
-async function calculateArbitrage(symbol, equityPrice, futuresPrice, expiryDays, futuresSymbol) {
+async function calculateArbitrage(symbol, equityPrice, futuresPrice, expiryDays, futuresSymbol, expiryMonthSymbol) {
   if (!equityPrice || !futuresPrice || equityPrice <= 0 || futuresPrice <= 0) {
     return null;
   }
-  
+
   const difference = futuresPrice - equityPrice;
   const percentageDiff = (difference / equityPrice) * 100;
-  
-  // Determine order type based on price difference
   const orderType = difference < 0 ? 'reverse' : 'arbitrage';
-  
-  // Get actual charges from Kite API
-  if (!kite) {
-    return null; // No API available, skip calculation
-  }
-  
+
+  if (!kite) return null;
+
   const chargesData = await getActualCharges(symbol, equityPrice, futuresPrice, futuresSymbol, orderType);
   if (!chargesData) {
     console.log(`  ⚠️ No charges data for ${symbol}, skipping`);
-    return null; // Charges API failed, skip calculation
+    return null;
   }
-  
+
   const charges = chargesData.chargePercent;
   console.log(`  📊 ${symbol}: Diff=${percentageDiff.toFixed(2)}%, Charges=${charges.toFixed(2)}%`);
-  
-  // For normal arbitrage (futures at premium)
-  let netReturn = percentageDiff - charges;
-  
-  // For reverse arbitrage (futures at discount)
+
+  // Reverse arbitrage: subtract absolute SLB fee + charges per share, then convert to %.
   if (difference < 0) {
-    // Reverse arbitrage: gain from discount minus charges
-    netReturn = Math.abs(percentageDiff) - charges;
+    const { feePerShare } = slbFetcher.getFee(symbol, expiryMonthSymbol);
+    const base = {
+      difference: difference.toFixed(2),
+      percentageDiff: percentageDiff.toFixed(2),
+      actualCharges: charges.toFixed(3),
+      lotSize: chargesData.lotSize,
+      marginRequired: chargesData.marginRequired,
+    };
+    if (feePerShare === 'NA') {
+      return { ...base, slbFee: 'NA', netReturn: 'NA', annualizedReturn: 'NA' };
+    }
+    const chargesPerShare = chargesData.chargeAmount / chargesData.lotSize;
+    const profitPerShare = equityPrice - futuresPrice;
+    const netPerShare = profitPerShare - chargesPerShare - feePerShare;
+    const netReturnPercent = (netPerShare / equityPrice) * 100;
+    const annualizedReturn = (Math.abs(netReturnPercent) * 365) / expiryDays;
+    return {
+      ...base,
+      slbFee: feePerShare.toFixed(2),
+      netReturn: netReturnPercent.toFixed(2),
+      annualizedReturn: annualizedReturn.toFixed(2),
+    };
   }
-  
-  // Annualized returns
+
+  // Normal arbitrage (futures at premium): unchanged
+  const netReturn = percentageDiff - charges;
   const annualizedReturn = (Math.abs(netReturn) * 365) / expiryDays;
-  
   return {
     difference: difference.toFixed(2),
     percentageDiff: percentageDiff.toFixed(2),
@@ -396,7 +409,7 @@ async function calculateArbitrage(symbol, equityPrice, futuresPrice, expiryDays,
     annualizedReturn: annualizedReturn.toFixed(2),
     actualCharges: charges.toFixed(3),
     lotSize: chargesData.lotSize,
-    marginRequired: chargesData.marginRequired
+    marginRequired: chargesData.marginRequired,
   };
 }
 
@@ -551,10 +564,10 @@ async function updateArbitrageData() {
       const futuresPrice = futureTick.last_price;
 
       // Create async promise for calculating arbitrage with actual charges
-      const promise = calculateArbitrage(symbol, equityPrice, futuresPrice, daysToExpiry, futureSymbol)
+      const promise = calculateArbitrage(symbol, equityPrice, futuresPrice, daysToExpiry, futureSymbol, expiry.symbol)
         .then(arb => {
           if (!arb) return;
-          
+
           const dataPoint = {
             symbol,
             equityPrice: equityPrice.toFixed(2),
@@ -564,21 +577,21 @@ async function updateArbitrageData() {
             daysToExpiry,
             ...arb
           };
-          
+
           // Normal arbitrage (futures at premium)
           if (parseFloat(arb.difference) > 0 && parseFloat(arb.netReturn) > 0) {
             console.log(`✅ Normal arbitrage: ${symbol} - Net Return: ${arb.netReturn}%`);
             arbitrageData.push(dataPoint);
           }
-          
-          // Reverse arbitrage (futures at discount)
-          // Show all reverse arbitrage opportunities with positive net return
-          if (parseFloat(arb.difference) < 0 && parseFloat(arb.netReturn) > 0) {
-            console.log(`✅ Reverse arbitrage: ${symbol} - Net Return: ${arb.netReturn}%`);
-            reverseArbitrageData.push({
-              ...dataPoint,
-              slbFee: '' // Empty column for SLB fee to be added later
-            });
+
+          // Reverse arbitrage (futures at discount):
+          // - show profitable rows (netReturn > 0)
+          // - also show rows with no SLB data (slbFee === 'NA') so the trader sees the opportunity exists
+          if (parseFloat(arb.difference) < 0) {
+            if (arb.slbFee === 'NA' || parseFloat(arb.netReturn) > 0) {
+              console.log(`✅ Reverse arbitrage: ${symbol} - SLB: ${arb.slbFee}, Net Return: ${arb.netReturn}`);
+              reverseArbitrageData.push(dataPoint);
+            }
           }
         });
       
@@ -589,9 +602,14 @@ async function updateArbitrageData() {
   // Wait for all calculations to complete
   await Promise.all(promises);
   
-  // Sort by annualized returns
+  // Sort by annualized returns; reverse-arb sorted by discount magnitude with NA-SLB rows last.
   arbitrageData.sort((a, b) => parseFloat(b.annualizedReturn) - parseFloat(a.annualizedReturn));
-  reverseArbitrageData.sort((a, b) => Math.abs(parseFloat(b.difference)) - Math.abs(parseFloat(a.difference)));
+  reverseArbitrageData.sort((a, b) => {
+    const aNa = a.slbFee === 'NA';
+    const bNa = b.slbFee === 'NA';
+    if (aNa !== bNa) return aNa ? 1 : -1;
+    return Math.abs(parseFloat(b.difference)) - Math.abs(parseFloat(a.difference));
+  });
   
   console.log(`Found ${arbitrageData.length} arbitrage and ${reverseArbitrageData.length} reverse arbitrage opportunities`);
   console.log(`Charges cached: ${Object.keys(chargesCache.arbitrage).length} arbitrage, ${Object.keys(chargesCache.reverse).length} reverse`);
@@ -719,10 +737,22 @@ async function initialize() {
   
   isInitialized = true;
   console.log('✅ Initialization complete');
-  
+
   // Start fetching quotes periodically (once per minute)
   setInterval(fetchQuotesPeriodically, 60000); // Every 60 seconds
   fetchQuotesPeriodically(); // Initial fetch immediately
+
+  // SLB fee refresh: once on startup, then hourly.
+  const refreshSlb = () => {
+    const months = getFuturesExpiries().map(e => e.symbol);
+    if (months.length === 0) {
+      console.log('[slb] no expiries yet, skipping refresh');
+      return;
+    }
+    slbFetcher.refresh(months).catch(e => console.error('[slb] refresh failed:', e.message));
+  };
+  refreshSlb();
+  setInterval(refreshSlb, 60 * 60 * 1000);
 }
 
 // API Endpoints
@@ -732,7 +762,8 @@ app.get('/api/status', (req, res) => {
     connected: !!ticker,
     instrumentsLoaded: equityInstruments.length > 0,
     dataPoints: Object.keys(tickData).length,
-    isInitialized
+    isInitialized,
+    slb: slbFetcher.getStatus(),
   });
 });
 

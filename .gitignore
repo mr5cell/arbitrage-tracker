@@ -16,6 +16,8 @@ npm-debug.log*
 .token_cache.json
 kite-auto-auth/.token_cache.json
 kite-auto-auth/config.json
+slb/last.json
+slb/downloads/
 
 # Test files
 test-*.js
