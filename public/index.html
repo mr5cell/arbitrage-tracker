@@ -1,0 +1,813 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Arbitrage Opportunities</title>
+  <link href="https://fonts.googleapis.com/css?family=Inter:400,500,600" rel="stylesheet">
+  
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, sans-serif;
+      font-size: 16px;
+      font-weight: 400;
+      color: #424242;
+      background: #fbfbfb;
+      line-height: 1.5;
+    }
+
+    /* Header */
+    .navbar {
+      background: #fff;
+      border-bottom: 1px solid #eaeaea;
+      padding: 20px 0;
+      margin-bottom: 30px;
+    }
+
+    .nav-content {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .navbar .logo {
+      height: 20px;
+      vertical-align: middle;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 30px;
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      align-items: center;
+    }
+
+    .nav-links a {
+      color: #666;
+      text-decoration: none;
+      font-size: 14px;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover {
+      color: #387ed1;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 20px;
+    }
+
+    .page-header {
+      text-align: center;
+      padding: 20px 0;
+      margin-bottom: 20px;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 400;
+      color: #424242;
+      margin-bottom: 8px;
+      line-height: 1.3;
+    }
+
+    .subtitle {
+      color: #9b9b9b;
+      font-size: 1rem;
+      margin-bottom: 10px;
+    }
+
+    /* Page selector tabs */
+    .page-tabs {
+      display: flex;
+      gap: 30px;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #f0f0f0;
+      justify-content: center;
+    }
+
+    .page-tab {
+      color: #666;
+      text-decoration: none;
+      padding: 10px 0;
+      margin-bottom: -2px;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+    }
+
+    .page-tab:hover {
+      color: #387ed1;
+    }
+
+    .page-tab.active {
+      color: #387ed1;
+      border-bottom-color: #387ed1;
+      font-weight: 500;
+    }
+
+    /* Status Bar */
+    .status-bar {
+      background: #f4f4f4;
+      padding: 15px;
+      border-radius: 3px;
+      margin-bottom: 30px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #666;
+      font-size: 14px;
+    }
+
+    /* Month selector */
+    .controls-bar {
+      margin-bottom: 30px;
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .month-selector {
+      display: flex;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .month-option {
+      padding: 10px 20px;
+      background: #fff;
+      border: none;
+      color: #666;
+      cursor: pointer;
+      font-size: 14px;
+      font-family: inherit;
+      transition: all 0.2s;
+    }
+
+    .month-option:not(:last-child) {
+      border-right: 1px solid #ddd;
+    }
+
+    .month-option:hover {
+      background: #f8f8f8;
+    }
+
+    .month-option.active {
+      background: #387ed1;
+      color: white;
+    }
+
+    /* Table */
+    .table-wrapper {
+      background: #fff;
+      border-radius: 3px;
+      overflow: hidden;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th {
+      background: #f5f5f5;
+      padding: 12px 15px;
+      text-align: left;
+      font-weight: 400;
+      font-size: 13px;
+      color: #666;
+      border-bottom: 2px solid #e0e0e0;
+    }
+
+    td {
+      padding: 12px 15px;
+      border-bottom: 1px solid #f0f0f0;
+      font-size: 14px;
+    }
+
+    tr:hover {
+      background: #fafafa;
+    }
+
+    .symbol {
+      font-weight: 500;
+      color: #424242;
+    }
+
+    .positive {
+      color: rgb(76, 175, 80);
+      font-weight: 400;
+    }
+
+    .negative {
+      color: #eb5b3c;
+      font-weight: 500;
+    }
+
+    .trade-btn {
+      background: #387ed1;
+      color: white;
+      border: none;
+      padding: 6px 12px;
+      border-radius: 3px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .trade-btn:hover {
+      background: #2e6bb8;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #9b9b9b;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #666;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 30px;
+      height: 30px;
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #387ed1;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+
+    /* Search bar */
+    .search-bar {
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+      padding: 8px 15px;
+      font-size: 14px;
+      width: 250px;
+      font-family: inherit;
+    }
+
+    .search-bar:focus {
+      outline: none;
+      border-color: #387ed1;
+      box-shadow: 0 0 0 2px rgba(56, 126, 209, 0.1);
+    }
+
+    /* Sortable headers */
+    th.sortable {
+      cursor: pointer;
+      user-select: none;
+      position: relative;
+      padding-right: 25px;
+    }
+
+    th.sortable:hover {
+      background: #eee;
+    }
+
+    th.sortable::after {
+      content: '⇅';
+      position: absolute;
+      right: 8px;
+      opacity: 0.3;
+      font-size: 11px;
+    }
+
+    th.sortable.asc::after {
+      content: '↑';
+      opacity: 1;
+      color: #387ed1;
+    }
+
+    th.sortable.desc::after {
+      content: '↓';
+      opacity: 1;
+      color: #387ed1;
+    }
+
+    /* Column filter */
+    .filter-wrapper {
+      position: relative;
+      display: inline-block;
+    }
+
+    .filter-icon {
+      display: inline-block;
+      margin-left: 5px;
+      cursor: pointer;
+      opacity: 0.5;
+      font-size: 12px;
+    }
+
+    .filter-icon:hover {
+      opacity: 1;
+    }
+
+    .filter-icon.active {
+      opacity: 1;
+      color: #387ed1;
+    }
+
+    .filter-dropdown {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+      padding: 10px;
+      min-width: 200px;
+      z-index: 1000;
+      margin-top: 5px;
+    }
+
+    .filter-dropdown.show {
+      display: block;
+    }
+
+    .filter-input {
+      width: 100%;
+      padding: 5px;
+      border: 1px solid #ddd;
+      border-radius: 3px;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+
+    .filter-apply {
+      background: #387ed1;
+      color: white;
+      border: none;
+      padding: 5px 10px;
+      border-radius: 3px;
+      font-size: 12px;
+      cursor: pointer;
+      margin-right: 5px;
+    }
+
+    .filter-clear {
+      background: #999;
+      color: white;
+      border: none;
+      padding: 5px 10px;
+      border-radius: 3px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .filter-apply:hover {
+      background: #2e6bb8;
+    }
+
+    .filter-clear:hover {
+      background: #777;
+    }
+
+    /* Footer */
+    .footer {
+      margin-top: 60px;
+      padding: 30px 0;
+      border-top: 1px solid #eaeaea;
+      text-align: center;
+      color: #9b9b9b;
+      font-size: 14px;
+    }
+
+    .footer-status {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .status-indicator {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #eb5b3c;
+    }
+
+    .status-indicator.active {
+      background: #57dd43;
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <nav class="navbar">
+    <div class="nav-content">
+      <img src="https://zerodha.com/static/images/logo.svg" alt="Zerodha" class="logo">
+      <ul class="nav-links">
+        <li><a href="https://zerodha.com/open-account/">Signup</a></li>
+        <li><a href="https://zerodha.com/about/">About</a></li>
+        <li><a href="https://zerodha.com/products/">Products</a></li>
+        <li><a href="https://zerodha.com/pricing/">Pricing</a></li>
+        <li><a href="https://support.zerodha.com">Support</a></li>
+      </ul>
+    </div>
+  </nav>
+
+  <!-- Main Content -->
+  <div class="container">
+    <div class="page-header">
+      <h1>Arbitrage Opportunities</h1>
+      <p class="subtitle">Cash and Carry Arbitrage - Buy Spot, Sell Futures</p>
+    </div>
+
+    <!-- Page Tabs -->
+    <div class="page-tabs">
+      <a href="/" class="page-tab active">Arbitrage</a>
+      <a href="/reverse" class="page-tab">Reverse Arbitrage</a>
+    </div>
+
+    <!-- Controls -->
+    <div class="controls-bar">
+      <div class="month-selector">
+        <button class="month-option active" data-month="current">Current Month</button>
+        <button class="month-option" data-month="next">Next Month</button>
+        <button class="month-option" data-month="far">Far Month</button>
+      </div>
+      <input type="text" class="search-bar" id="search-input" placeholder="Search symbols...">
+    </div>
+
+    <!-- Table -->
+    <div class="table-wrapper">
+      <div id="loading" class="loading">
+        <div class="spinner"></div>
+        <p>Loading data...</p>
+      </div>
+      <table id="arbitrage-table" style="display: none;">
+        <thead>
+          <tr>
+            <th class="sortable" data-column="symbol">Symbol</th>
+            <th class="sortable" data-column="equityPrice">Spot price</th>
+            <th class="sortable" data-column="futuresPrice">Futures price</th>
+            <th class="sortable" data-column="percentageDiff">
+              <span>Premium %</span>
+              <span class="filter-icon" data-column="percentageDiff">⚙</span>
+              <div class="filter-dropdown" id="filter-percentageDiff">
+                <input type="number" class="filter-input" placeholder="Greater than..." step="0.1">
+                <button class="filter-apply">Apply</button>
+                <button class="filter-clear">Clear</button>
+              </div>
+            </th>
+            <th class="sortable" data-column="netReturn">
+              <span>Net return</span>
+              <span class="filter-icon" data-column="netReturn">⚙</span>
+              <div class="filter-dropdown" id="filter-netReturn">
+                <input type="number" class="filter-input" placeholder="Greater than..." step="0.1">
+                <button class="filter-apply">Apply</button>
+                <button class="filter-clear">Clear</button>
+              </div>
+            </th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="table-body">
+        </tbody>
+      </table>
+      <div id="empty-state" class="empty-state" style="display: none;">
+        <p>No arbitrage opportunities found for selected month</p>
+      </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <div class="status-item">
+        <span>Last Update: <span id="last-update">--</span></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <p>Arbitrage Tracker - Real-time opportunities</p>
+    <div class="footer-status">
+      <div class="status-indicator" id="status-indicator"></div>
+      <span id="status-text">Disconnected</span>
+    </div>
+  </div>
+
+  <script>
+    let currentMonth = 'current';
+    let refreshInterval = null;
+    let allData = [];
+    let sortColumn = 'netReturn';
+    let sortOrder = 'desc';
+    let filters = {};
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+      // Check URL hash for initial month
+      const hash = window.location.hash.replace('#', '');
+      if (['current', 'next', 'far'].includes(hash)) {
+        currentMonth = hash;
+      } else {
+        // Set default hash if none exists
+        window.location.hash = currentMonth;
+      }
+      
+      setupMonthSelector();
+      setupSorting();
+      setupSearch();
+      setupFilters();
+      startDataRefresh();
+      checkStatus();
+      
+      // Handle hash changes (browser back/forward)
+      window.addEventListener('hashchange', () => {
+        const newMonth = window.location.hash.replace('#', '');
+        if (['current', 'next', 'far'].includes(newMonth) && newMonth !== currentMonth) {
+          currentMonth = newMonth;
+          updateMonthButtons();
+          fetchData();
+        }
+      });
+    });
+
+    // Setup month selector
+    function setupMonthSelector() {
+      const buttons = document.querySelectorAll('.month-option');
+      buttons.forEach(btn => {
+        btn.addEventListener('click', () => {
+          currentMonth = btn.dataset.month;
+          window.location.hash = currentMonth;
+          updateMonthButtons();
+          fetchData();
+        });
+      });
+      
+      // Set initial active state based on current month
+      updateMonthButtons();
+    }
+    
+    // Update month button states
+    function updateMonthButtons() {
+      const buttons = document.querySelectorAll('.month-option');
+      buttons.forEach(btn => {
+        if (btn.dataset.month === currentMonth) {
+          btn.classList.add('active');
+        } else {
+          btn.classList.remove('active');
+        }
+      });
+    }
+
+    // Setup sorting
+    function setupSorting() {
+      document.querySelectorAll('th.sortable').forEach(header => {
+        header.addEventListener('click', (e) => {
+          if (e.target.classList.contains('filter-icon')) return;
+          
+          const column = header.dataset.column;
+          if (sortColumn === column) {
+            sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+          } else {
+            sortColumn = column;
+            sortOrder = 'desc';
+          }
+          
+          // Update header classes
+          document.querySelectorAll('th.sortable').forEach(h => {
+            h.classList.remove('asc', 'desc');
+          });
+          header.classList.add(sortOrder);
+          
+          applyFiltersAndSort();
+        });
+      });
+    }
+
+    // Setup search
+    function setupSearch() {
+      const searchInput = document.getElementById('search-input');
+      searchInput.addEventListener('input', () => {
+        applyFiltersAndSort();
+      });
+    }
+
+    // Setup filters
+    function setupFilters() {
+      // Filter icons
+      document.querySelectorAll('.filter-icon').forEach(icon => {
+        icon.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const dropdown = document.getElementById(`filter-${icon.dataset.column}`);
+          
+          // Close other dropdowns
+          document.querySelectorAll('.filter-dropdown').forEach(d => {
+            if (d !== dropdown) d.classList.remove('show');
+          });
+          
+          dropdown.classList.toggle('show');
+        });
+      });
+      
+      // Apply buttons
+      document.querySelectorAll('.filter-apply').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const dropdown = btn.parentElement;
+          const column = dropdown.id.replace('filter-', '');
+          const input = dropdown.querySelector('.filter-input');
+          const value = parseFloat(input.value);
+          
+          if (!isNaN(value)) {
+            filters[column] = value;
+            dropdown.previousElementSibling.classList.add('active');
+          } else {
+            delete filters[column];
+            dropdown.previousElementSibling.classList.remove('active');
+          }
+          
+          dropdown.classList.remove('show');
+          applyFiltersAndSort();
+        });
+      });
+      
+      // Clear buttons
+      document.querySelectorAll('.filter-clear').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const dropdown = btn.parentElement;
+          const column = dropdown.id.replace('filter-', '');
+          const input = dropdown.querySelector('.filter-input');
+          
+          input.value = '';
+          delete filters[column];
+          dropdown.previousElementSibling.classList.remove('active');
+          dropdown.classList.remove('show');
+          applyFiltersAndSort();
+        });
+      });
+      
+      // Close dropdowns when clicking outside
+      document.addEventListener('click', (e) => {
+        if (!e.target.closest('.filter-icon') && !e.target.closest('.filter-dropdown')) {
+          document.querySelectorAll('.filter-dropdown').forEach(d => {
+            d.classList.remove('show');
+          });
+        }
+      });
+    }
+
+    // Apply filters and sort
+    function applyFiltersAndSort() {
+      let filteredData = [...allData];
+      
+      // Apply search
+      const searchTerm = document.getElementById('search-input').value.toLowerCase();
+      if (searchTerm) {
+        filteredData = filteredData.filter(item => 
+          item.symbol.toLowerCase().includes(searchTerm)
+        );
+      }
+      
+      // Apply column filters
+      Object.keys(filters).forEach(column => {
+        const value = filters[column];
+        filteredData = filteredData.filter(item => 
+          parseFloat(item[column]) > value
+        );
+      });
+      
+      // Sort data
+      filteredData.sort((a, b) => {
+        let aVal = a[sortColumn];
+        let bVal = b[sortColumn];
+        
+        // Handle numeric values
+        if (!isNaN(parseFloat(aVal))) aVal = parseFloat(aVal);
+        if (!isNaN(parseFloat(bVal))) bVal = parseFloat(bVal);
+        
+        if (sortOrder === 'asc') {
+          return aVal > bVal ? 1 : -1;
+        } else {
+          return aVal < bVal ? 1 : -1;
+        }
+      });
+      
+      displayData(filteredData);
+    }
+
+    // Fetch data
+    async function fetchData() {
+      try {
+        const response = await fetch(`/api/arbitrage/normal/${currentMonth}`);
+        const data = await response.json();
+        allData = data;
+        applyFiltersAndSort();
+      } catch (error) {
+        console.error('Error fetching data:', error);
+      }
+    }
+
+    // Display data in table
+    function displayData(data) {
+      const loading = document.getElementById('loading');
+      const table = document.getElementById('arbitrage-table');
+      const empty = document.getElementById('empty-state');
+      const tbody = document.getElementById('table-body');
+      
+      loading.style.display = 'none';
+      
+      if (data.length === 0) {
+        table.style.display = 'none';
+        empty.style.display = 'block';
+        return;
+      }
+      
+      table.style.display = 'table';
+      empty.style.display = 'none';
+      
+      tbody.innerHTML = data.map(item => `
+        <tr>
+          <td class="symbol">${item.symbol}</td>
+          <td>₹${item.equityPrice}</td>
+          <td>₹${item.futuresPrice}</td>
+          <td class="${parseFloat(item.percentageDiff) > 0 ? 'positive' : 'negative'}">
+            ${item.percentageDiff}%
+          </td>
+          <td class="${parseFloat(item.netReturn) > 0 ? 'positive' : 'negative'}" title="Annualized: ${item.annualizedReturn}%">
+            ${item.netReturn}%
+          </td>
+          <td>
+            <button class="trade-btn" onclick="executeTrade('${item.symbol}', '${item.expiry}')">
+              Trade
+            </button>
+          </td>
+        </tr>
+      `).join('');
+      
+      // Update last update time
+      document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+    }
+
+    // Execute trade (dummy for now)
+    function executeTrade(symbol, expiry) {
+      alert(`Trade functionality will be implemented with Kite Publisher basket for ${symbol} ${expiry}`);
+    }
+
+    // Check status
+    async function checkStatus() {
+      try {
+        const response = await fetch('/api/status');
+        const status = await response.json();
+        
+        const indicator = document.getElementById('status-indicator');
+        const text = document.getElementById('status-text');
+        
+        if (status.connected) {
+          indicator.classList.add('active');
+          text.textContent = 'Connected';
+        } else {
+          indicator.classList.remove('active');
+          text.textContent = 'Disconnected';
+        }
+      } catch (error) {
+        console.error('Error checking status:', error);
+      }
+    }
+
+    // Start data refresh
+    function startDataRefresh() {
+      fetchData();
+      setInterval(fetchData, 5000); // Refresh every 5 seconds
+      setInterval(checkStatus, 10000); // Check status every 10 seconds
+    }
+  </script>
+</body>
+</html>

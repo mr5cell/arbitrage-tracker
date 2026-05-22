@@ -1,0 +1,876 @@
+require('dotenv').config();
+
+const express = require('express');
+const axios = require('axios');
+const KiteTicker = require('kiteconnect').KiteTicker;
+const path = require('path');
+const cors = require('cors');
+const fs = require('fs');
+const { login: kiteLogin, getKite } = require('./kite-auto-auth');
+const timeUtils = require('./utils/timeUtils');
+
+// Initialize environment variables and create config
+function initializeConfig() {
+  if (process.env.KITE_API_KEY) {
+    console.log('Using environment variables for configuration');
+    
+    const config = {
+      username: process.env.KITE_USERNAME,
+      password: process.env.KITE_PASSWORD,
+      totpSecret: process.env.KITE_TOTP_SECRET,
+      apiKey: process.env.KITE_API_KEY,
+      apiSecret: process.env.KITE_API_SECRET
+    };
+
+    const required = ['KITE_USERNAME', 'KITE_PASSWORD', 'KITE_TOTP_SECRET', 'KITE_API_KEY', 'KITE_API_SECRET'];
+    for (const field of required) {
+      if (!process.env[field]) {
+        throw new Error(`Environment variable ${field} is required`);
+      }
+    }
+
+    try {
+      const configPath = path.join(__dirname, 'kite-auto-auth', 'config.json');
+      const configDir = path.dirname(configPath);
+      if (!fs.existsSync(configDir)) {
+        fs.mkdirSync(configDir, { recursive: true });
+      }
+      
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+      console.log('Created config.json from environment variables');
+    } catch (writeError) {
+      console.log('Cannot write config.json (read-only filesystem), using environment variables directly');
+      global.kiteConfig = config;
+    }
+  } else {
+    console.log('Using existing config.json file');
+  }
+}
+
+// Initialize configuration
+initializeConfig();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+console.log(`🔧 Using PORT: ${PORT}`);
+
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production' 
+    ? [process.env.FRONTEND_URL, 'https://your-domain.com']
+    : ['http://localhost:3000', 'http://127.0.0.1:3000'],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.use(express.json());
+app.use(express.static('public'));
+
+// Store global state
+let accessToken = null;
+let kite = null;
+let ticker = null;
+let equityInstruments = [];
+let futuresInstruments = [];
+let tickData = {};
+let arbitrageData = [];
+let reverseArbitrageData = [];
+let isInitialized = false;
+let marketCheckInterval = null;
+
+// Initialize Kite authentication
+async function initializeAuth() {
+  try {
+    console.log('Initializing authentication...');
+    
+    if (!global.kiteConfig && process.env.KITE_API_KEY) {
+      global.kiteConfig = {
+        username: process.env.KITE_USERNAME,
+        password: process.env.KITE_PASSWORD,
+        totpSecret: process.env.KITE_TOTP_SECRET,
+        apiKey: process.env.KITE_API_KEY,
+        apiSecret: process.env.KITE_API_SECRET
+      };
+    }
+    
+    // Use the kiteLogin function from kite-auto-auth
+    const token = await kiteLogin();
+    
+    if (token) {
+      accessToken = token;
+      
+      // Get the authenticated KiteConnect instance from kite-auto-auth
+      kite = await getKite();
+      
+      console.log('✅ Authentication successful');
+      console.log('Access token:', token.substring(0, 10) + '...');
+      console.log('Kite instance type:', kite.constructor.name);
+      return true;
+    } else {
+      throw new Error('Authentication failed - no access token received');
+    }
+  } catch (error) {
+    console.error('❌ Authentication error:', error.message);
+    return false;
+  }
+}
+
+// Get futures expiry dates from actual instruments
+function getFuturesExpiries() {
+  // Get unique expiry dates from futures instruments
+  const expiryMap = new Map();
+  
+  futuresInstruments.forEach(inst => {
+    if (inst.instrument_type === 'FUT' && inst.expiry) {
+      const expiryDate = new Date(inst.expiry);
+      const expiryStr = inst.expiry;
+      
+      // Store the actual expiry date and corresponding symbol format
+      if (!expiryMap.has(expiryStr)) {
+        // Extract the symbol format from tradingsymbol
+        // Examples: RELIANCE26MAYFUT, TCS26JUNFUT, INFY26JULFUT
+        const match = inst.tradingsymbol.match(/[A-Z]+(\d{2}[A-Z]{3})FUT$/);
+        if (match) {
+          expiryMap.set(expiryStr, {
+            date: expiryDate,
+            symbol: match[1], // This gets "26MAY", "26JUN", etc.
+            timestamp: expiryDate.getTime()
+          });
+        }
+      }
+    }
+  });
+  
+  // Sort expiries by date and take first 3 unique ones
+  const sortedExpiries = Array.from(expiryMap.values())
+    .sort((a, b) => a.timestamp - b.timestamp)
+    .filter((exp, index, self) => 
+      index === self.findIndex(e => e.symbol === exp.symbol)
+    )
+    .slice(0, 3);
+  
+  // Map to current/next/far
+  const expiries = sortedExpiries.map((exp, index) => ({
+    type: index === 0 ? 'current' : index === 1 ? 'next' : 'far',
+    date: exp.date,
+    symbol: exp.symbol
+  }));
+  
+  console.log('Actual expiries from instruments:', expiries.map(e => `${e.type}: ${e.symbol} (${e.date.toISOString().split('T')[0]})`));
+  
+  return expiries;
+}
+
+// Get F&O stocks and their futures
+async function loadInstruments() {
+  try {
+    console.log('Loading instruments...');
+    // Get instruments separately for each exchange
+    const nseInstruments = await kite.getInstruments('NSE');
+    const nfoInstruments = await kite.getInstruments('NFO');
+    
+    // Combine the instruments
+    const allInstruments = [...nseInstruments, ...nfoInstruments];
+    
+    // Filter equity instruments (F&O stocks)
+    equityInstruments = nseInstruments.filter(inst => 
+      inst.instrument_type === 'EQ'
+    );
+    
+    // Filter futures instruments
+    futuresInstruments = nfoInstruments.filter(inst => 
+      inst.instrument_type === 'FUT' &&
+      inst.segment === 'NFO-FUT'
+    );
+    
+    console.log(`Loaded ${equityInstruments.length} equity instruments`);
+    console.log(`Loaded ${futuresInstruments.length} futures instruments`);
+    
+    return true;
+  } catch (error) {
+    console.error('Error loading instruments:', error);
+    console.error('Error details:', error.message, error.data);
+    return false;
+  }
+}
+
+// Cache for charges calculation - separate caches for different order types
+let chargesCache = {
+  arbitrage: {},    // Buy spot, sell futures
+  reverse: {},      // Sell spot (SLB), buy futures
+  timestamp: {}     // Track when each was last updated
+};
+
+// Get actual charges using Kite margins API
+async function getActualCharges(symbol, equityPrice, futuresPrice, futuresSymbol, orderType = 'arbitrage') {
+  try {
+    console.log(`🔍 Calculating charges for ${symbol} (${futuresSymbol}): Spot=₹${equityPrice}, Futures=₹${futuresPrice}, Type=${orderType}`);
+    
+    // Cache key includes symbol, futures contract, and order type
+    const cacheKey = `${symbol}_${futuresSymbol}_${orderType}`;
+    const cacheCategory = orderType === 'reverse' ? chargesCache.reverse : chargesCache.arbitrage;
+    
+    // Check cache first (refresh every 10 minutes per symbol)
+    if (cacheCategory[cacheKey] && chargesCache.timestamp[cacheKey] && 
+        (Date.now() - chargesCache.timestamp[cacheKey] < 10 * 60 * 1000)) {
+      const cachedData = cacheCategory[cacheKey];
+      if (cachedData && typeof cachedData.chargePercent === 'number') {
+        console.log(`📋 Using cached charges for ${symbol} (${orderType}): ${cachedData.chargePercent.toFixed(3)}%`);
+        return cachedData;
+      }
+    }
+    
+    // Find the futures instrument to get lot size
+    const futureInst = futuresInstruments.find(inst => 
+      inst.tradingsymbol === futuresSymbol
+    );
+    const lotSize = futureInst ? futureInst.lot_size : 1;
+    
+    // Create basket based on order type
+    const basket = orderType === 'reverse' ? [
+      {
+        exchange: "NSE",
+        tradingsymbol: symbol,
+        transaction_type: "SELL",  // Sell spot (via SLB)
+        variety: "regular",
+        product: "MIS",  // Intraday for SLB
+        order_type: "MARKET",
+        quantity: lotSize,
+        price: equityPrice
+      },
+      {
+        exchange: "NFO",
+        tradingsymbol: futuresSymbol,
+        transaction_type: "BUY",  // Buy futures
+        variety: "regular", 
+        product: "NRML",
+        order_type: "MARKET",
+        quantity: lotSize,
+        price: futuresPrice
+      }
+    ] : [
+      {
+        exchange: "NSE",
+        tradingsymbol: symbol,
+        transaction_type: "BUY",  // Buy spot
+        variety: "regular",
+        product: "CNC",
+        order_type: "MARKET",
+        quantity: lotSize,
+        price: equityPrice
+      },
+      {
+        exchange: "NFO",
+        tradingsymbol: futuresSymbol,
+        transaction_type: "SELL",  // Sell futures
+        variety: "regular", 
+        product: "NRML",
+        order_type: "MARKET",
+        quantity: lotSize,
+        price: futuresPrice
+      }
+    ];
+    
+    // Get basket margins and charges
+    const response = await kite.orderBasketMargins(basket);
+    
+    if (response && response.orders && response.orders.length > 0) {
+      // Calculate total charges from all orders in the response
+      let totalChargeAmount = 0;
+      
+      response.orders.forEach(order => {
+        const orderCharges = order.charges || {};
+        const orderCharge = (
+          (orderCharges.transaction_tax || 0) +
+          (orderCharges.exchange_turnover_charge || 0) + 
+          (orderCharges.sebi_turnover_charge || 0) +
+          (orderCharges.brokerage || 0) +
+          (orderCharges.stamp_duty || 0) +
+          (orderCharges.gst?.total || orderCharges.gst || 0)
+        );
+        totalChargeAmount += orderCharge;
+        
+        console.log(`    Order ${order.tradingsymbol}: ₹${orderCharge.toFixed(2)}`);
+      });
+      
+      const chargeAmount = totalChargeAmount;
+      
+      // Convert to percentage of total value
+      const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
+      const chargePercent = (chargeAmount / totalValue) * 200; // As percentage of one leg
+      
+      console.log(`💰 Charges for ${symbol}: Total=₹${chargeAmount.toFixed(2)} (${chargePercent.toFixed(3)}%)`);
+      console.log(`   Lot Size: ${lotSize}, Trade Value: ₹${totalValue.toFixed(2)}`);
+      console.log(`   Margin Required: ₹${response.final?.total || 0}`);
+      
+      // Cache the result in the appropriate category
+      cacheCategory[cacheKey] = {
+        chargePercent,
+        lotSize,
+        marginRequired: response.final.total || 0
+      };
+      chargesCache.timestamp[cacheKey] = Date.now();
+      
+      return cacheCategory[cacheKey];
+    }
+    
+    // Response invalid, retry once after a small delay
+    console.log(`⚠️ Invalid response for ${symbol}, retrying...`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Retry the API call
+    try {
+      const retryResponse = await kite.orderBasketMargins(basket);
+      if (retryResponse && retryResponse.orders && retryResponse.orders.length > 0) {
+        let totalChargeAmount = 0;
+        retryResponse.orders.forEach(order => {
+          const orderCharges = order.charges || {};
+          totalChargeAmount += (
+            (orderCharges.transaction_tax || 0) +
+            (orderCharges.exchange_turnover_charge || 0) + 
+            (orderCharges.sebi_turnover_charge || 0) +
+            (orderCharges.brokerage || 0) +
+            (orderCharges.stamp_duty || 0) +
+            (orderCharges.gst?.total || orderCharges.gst || 0)
+          );
+        });
+        const chargeAmount = totalChargeAmount;
+        const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
+        const chargePercent = (chargeAmount / totalValue) * 200;
+        
+        cacheCategory[cacheKey] = {
+          chargePercent,
+          lotSize,
+          marginRequired: retryResponse.final.total || 0
+        };
+        chargesCache.timestamp[cacheKey] = Date.now();
+        console.log(`✅ Retry successful for ${symbol}`);
+        return cacheCategory[cacheKey];
+      }
+    } catch (retryError) {
+      console.log(`❌ Retry failed for ${symbol}: ${retryError.message}`);
+    }
+    
+    return null;
+    
+  } catch (error) {
+    console.log(`❌ Charges API error for ${symbol}: ${error.message}`);
+    
+    // If rate limit error, wait and retry
+    if (error.message && error.message.includes('rate')) {
+      console.log(`⏳ Rate limited, waiting 2 seconds...`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      try {
+        const retryResponse = await kite.orderBasketMargins(basket);
+        if (retryResponse && retryResponse.orders && retryResponse.orders.length > 0) {
+          let totalChargeAmount = 0;
+          retryResponse.orders.forEach(order => {
+            const orderCharges = order.charges || {};
+            totalChargeAmount += (
+              (orderCharges.transaction_tax || 0) +
+              (orderCharges.exchange_turnover_charge || 0) + 
+              (orderCharges.sebi_turnover_charge || 0) +
+              (orderCharges.brokerage || 0) +
+              (orderCharges.stamp_duty || 0) +
+              (orderCharges.gst?.total || orderCharges.gst || 0)
+            );
+          });
+          const chargeAmount = totalChargeAmount;
+          const totalValue = (equityPrice * lotSize) + (futuresPrice * lotSize);
+          const chargePercent = (chargeAmount / totalValue) * 200;
+          
+          cacheCategory[cacheKey] = {
+            chargePercent,
+            lotSize,
+            marginRequired: retryResponse.final.total || 0
+          };
+          chargesCache.timestamp[cacheKey] = Date.now();
+          console.log(`✅ Retry successful after rate limit for ${symbol}`);
+          return cacheCategory[cacheKey];
+        }
+      } catch (retryError) {
+        console.log(`❌ Retry after rate limit failed: ${retryError.message}`);
+      }
+    }
+    
+    return null;
+  }
+}
+
+// Calculate arbitrage opportunities
+async function calculateArbitrage(symbol, equityPrice, futuresPrice, expiryDays, futuresSymbol) {
+  if (!equityPrice || !futuresPrice || equityPrice <= 0 || futuresPrice <= 0) {
+    return null;
+  }
+  
+  const difference = futuresPrice - equityPrice;
+  const percentageDiff = (difference / equityPrice) * 100;
+  
+  // Determine order type based on price difference
+  const orderType = difference < 0 ? 'reverse' : 'arbitrage';
+  
+  // Get actual charges from Kite API
+  if (!kite) {
+    return null; // No API available, skip calculation
+  }
+  
+  const chargesData = await getActualCharges(symbol, equityPrice, futuresPrice, futuresSymbol, orderType);
+  if (!chargesData) {
+    console.log(`  ⚠️ No charges data for ${symbol}, skipping`);
+    return null; // Charges API failed, skip calculation
+  }
+  
+  const charges = chargesData.chargePercent;
+  console.log(`  📊 ${symbol}: Diff=${percentageDiff.toFixed(2)}%, Charges=${charges.toFixed(2)}%`);
+  
+  // For normal arbitrage (futures at premium)
+  let netReturn = percentageDiff - charges;
+  
+  // For reverse arbitrage (futures at discount)
+  if (difference < 0) {
+    // Reverse arbitrage: gain from discount minus charges
+    netReturn = Math.abs(percentageDiff) - charges;
+  }
+  
+  // Annualized returns
+  const annualizedReturn = (Math.abs(netReturn) * 365) / expiryDays;
+  
+  return {
+    difference: difference.toFixed(2),
+    percentageDiff: percentageDiff.toFixed(2),
+    netReturn: netReturn.toFixed(2),
+    annualizedReturn: annualizedReturn.toFixed(2),
+    actualCharges: charges.toFixed(3),
+    lotSize: chargesData.lotSize,
+    marginRequired: chargesData.marginRequired
+  };
+}
+
+// Start WebSocket ticker for live data
+async function startTicker() {
+  try {
+    if (!accessToken || !kite) {
+      console.error('Cannot start ticker - not authenticated');
+      return false;
+    }
+    
+    const apiKey = global.kiteConfig?.apiKey || process.env.KITE_API_KEY;
+    ticker = new KiteTicker({
+      api_key: apiKey,
+      access_token: accessToken
+    });
+    
+    ticker.connect();
+    
+    ticker.on('ticks', (ticks) => {
+      console.log(`Received ${ticks.length} ticks`);
+      ticks.forEach(tick => {
+        tickData[tick.instrument_token] = tick;
+      });
+      console.log(`Total tick data points: ${Object.keys(tickData).length}`);
+      updateArbitrageData();
+    });
+    
+    ticker.on('connect', () => {
+      console.log('✅ WebSocket connected');
+      subscribeToInstruments();
+    });
+    
+    ticker.on('disconnect', () => {
+      console.log('⚠️ WebSocket disconnected');
+    });
+    
+    ticker.on('error', (error) => {
+      console.error('WebSocket error:', error);
+    });
+    
+    ticker.on('order_update', (order) => {
+      console.log('Order update:', order);
+    });
+    
+    ticker.on('message', (msg) => {
+      console.log('WebSocket message:', msg);
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Error starting ticker:', error);
+    return false;
+  }
+}
+
+// Subscribe to instruments for live data
+function subscribeToInstruments() {
+  if (!ticker) return;
+  
+  // Get top F&O stocks (limit to prevent overwhelming)
+  const topStocks = ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 
+                    'HDFC', 'SBIN', 'BHARTIARTL', 'KOTAKBANK', 'ITC',
+                    'AXISBANK', 'LT', 'WIPRO', 'BAJFINANCE', 'MARUTI'];
+  
+  const tokens = [];
+  const expiries = getFuturesExpiries();
+  
+  topStocks.forEach(symbol => {
+    // Find equity instrument
+    const equity = equityInstruments.find(inst => inst.tradingsymbol === symbol);
+    if (equity) {
+      tokens.push(equity.instrument_token);
+    }
+    
+    // Find futures for current month
+    expiries.forEach(expiry => {
+      const futureSymbol = `${symbol}${expiry.symbol}FUT`;
+      const future = futuresInstruments.find(inst => 
+        inst.tradingsymbol === futureSymbol
+      );
+      if (future) {
+        tokens.push(future.instrument_token);
+      }
+    });
+  });
+  
+  if (tokens.length > 0) {
+    console.log('Subscribing to tokens:', tokens);
+    ticker.subscribe(tokens);
+    // Use modeLTP for testing - just get last traded price
+    ticker.setMode(ticker.modeLTP, tokens);
+    console.log(`Subscribed to ${tokens.length} instruments in LTP mode`);
+    
+    // Log what we're subscribing to
+    topStocks.slice(0, 3).forEach(symbol => {
+      const equity = equityInstruments.find(inst => inst.tradingsymbol === symbol);
+      if (equity) {
+        console.log(`${symbol}: token=${equity.instrument_token}, exchange=${equity.exchange}`);
+      }
+    });
+  } else {
+    console.log('WARNING: No tokens to subscribe to!');
+  }
+}
+
+// Update arbitrage data
+async function updateArbitrageData() {
+  arbitrageData = [];
+  reverseArbitrageData = [];
+  
+  const expiries = getFuturesExpiries();
+  const today = new Date();
+  
+  // Get all stocks that have tick data
+  const stocksWithData = new Set();
+  Object.values(tickData).forEach(tick => {
+    if (tick.exchange === 'NSE' && tick.tradingsymbol) {
+      stocksWithData.add(tick.tradingsymbol);
+    }
+  });
+  
+  const allStocks = Array.from(stocksWithData);
+  console.log(`Checking arbitrage for ${allStocks.length} stocks`);
+  console.log(`Total tick data entries: ${Object.keys(tickData).length}`);
+  
+  // Process all stocks in parallel for better performance
+  const promises = [];
+  
+  for (const symbol of allStocks) {
+    // Find equity tick data by symbol
+    const equityKey = `NSE:${symbol}`;
+    const equityTick = Object.values(tickData).find(tick => 
+      tick.exchange === 'NSE' && tick.tradingsymbol === symbol
+    );
+    
+    if (!equityTick || !equityTick.last_price) continue;
+    
+    for (const expiry of expiries) {
+      // Calculate days to this specific expiry
+      const daysToExpiry = Math.max(1, Math.ceil((expiry.date - today) / (1000 * 60 * 60 * 24)));
+      
+      // Find futures tick data
+      const futureSymbol = `${symbol}${expiry.symbol}FUT`;
+      const futureTick = Object.values(tickData).find(tick => 
+        tick.exchange === 'NFO' && tick.tradingsymbol === futureSymbol
+      );
+      
+      if (!futureTick || !futureTick.last_price) continue;
+      
+      const equityPrice = equityTick.last_price;
+      const futuresPrice = futureTick.last_price;
+      
+      // Debug first few price differences
+      if (promises.length < 3) {
+        const diff = ((futuresPrice - equityPrice) / equityPrice) * 100;
+        console.log(`${symbol} ${expiry.symbol}: Spot=₹${equityPrice}, Futures=₹${futuresPrice}, Diff=${diff.toFixed(3)}%`);
+      }
+      
+      // Create async promise for calculating arbitrage with actual charges
+      const promise = calculateArbitrage(symbol, equityPrice, futuresPrice, daysToExpiry, futureSymbol)
+        .then(arb => {
+          if (!arb) return;
+          
+          const dataPoint = {
+            symbol,
+            equityPrice: equityPrice.toFixed(2),
+            futuresPrice: futuresPrice.toFixed(2),
+            expiryType: expiry.type,
+            expiry: expiry.symbol,
+            daysToExpiry,
+            ...arb
+          };
+          
+          // Normal arbitrage (futures at premium)
+          if (parseFloat(arb.difference) > 0 && parseFloat(arb.netReturn) > 0) {
+            console.log(`✅ Normal arbitrage: ${symbol} - Net Return: ${arb.netReturn}%`);
+            arbitrageData.push(dataPoint);
+          }
+          
+          // Reverse arbitrage (futures at discount)
+          // Show all reverse arbitrage opportunities with positive net return
+          if (parseFloat(arb.difference) < 0 && parseFloat(arb.netReturn) > 0) {
+            console.log(`✅ Reverse arbitrage: ${symbol} - Net Return: ${arb.netReturn}%`);
+            reverseArbitrageData.push({
+              ...dataPoint,
+              slbFee: '' // Empty column for SLB fee to be added later
+            });
+          }
+        });
+      
+      promises.push(promise);
+    }
+  }
+  
+  // Wait for all calculations to complete
+  await Promise.all(promises);
+  
+  // Sort by annualized returns
+  arbitrageData.sort((a, b) => parseFloat(b.annualizedReturn) - parseFloat(a.annualizedReturn));
+  reverseArbitrageData.sort((a, b) => Math.abs(parseFloat(b.difference)) - Math.abs(parseFloat(a.difference)));
+  
+  console.log(`Found ${arbitrageData.length} arbitrage and ${reverseArbitrageData.length} reverse arbitrage opportunities`);
+  console.log(`Charges cached: ${Object.keys(chargesCache.arbitrage).length} arbitrage, ${Object.keys(chargesCache.reverse).length} reverse`);
+  
+  // Debug: Show some sample price data to understand what we're working with
+  if (arbitrageData.length === 0 && reverseArbitrageData.length === 0) {
+    console.log('\n📊 Debug: Sample price data from quotes:');
+    let sampleCount = 0;
+    for (const [key, tick] of Object.entries(tickData)) {
+      if (sampleCount >= 5) break;
+      if (tick.exchange === 'NSE' && tick.last_price) {
+        const symbol = tick.tradingsymbol;
+        const spotPrice = tick.last_price;
+        
+        // Find corresponding futures
+        const currentFuture = tickData[`NFO:${symbol}26MAYFUT`];
+        if (currentFuture && currentFuture.last_price) {
+          console.log(`${symbol}: Spot=₹${spotPrice}, Futures=₹${currentFuture.last_price}, Diff=${(currentFuture.last_price - spotPrice).toFixed(2)}`);
+          sampleCount++;
+        }
+      }
+    }
+  }
+}
+
+// Fetch quotes via HTTP API
+async function fetchQuotesPeriodically() {
+  console.log('📊 fetchQuotesPeriodically called');
+  console.log(`  kite: ${kite ? 'available' : 'null'}`);
+  console.log(`  isInitialized: ${isInitialized}`);
+  console.log(`  futuresInstruments.length: ${futuresInstruments.length}`);
+  
+  if (!kite || !isInitialized || futuresInstruments.length === 0) {
+    console.log('  ❌ Skipping fetch due to missing requirements');
+    return;
+  }
+  
+  try {
+    // Get ALL F&O stocks from futures instruments - NO LIMITS!
+    const fnoStocks = new Set();
+    futuresInstruments.forEach(inst => {
+      if (inst.instrument_type === 'FUT' && inst.name !== 'NIFTY' && inst.name !== 'BANKNIFTY') {
+        // Extract stock symbol from futures symbol (e.g., RELIANCE26MAYFUT -> RELIANCE)
+        const match = inst.tradingsymbol.match(/^([A-Z]+)\d{2}[A-Z]{3}FUT$/);
+        if (match) {
+          fnoStocks.add(match[1]);
+        }
+      }
+    });
+    
+    // Convert to array and sort
+    const allFnOStocks = Array.from(fnoStocks).sort();
+    console.log(`Found ${allFnOStocks.length} F&O stocks - fetching ALL of them!`);
+    
+    const expiries = getFuturesExpiries();
+    
+    if (expiries.length === 0) {
+      console.log('No expiries found, skipping quote fetch');
+      return;
+    }
+    
+    // Build instrument list for ALL stocks and ALL expiry months
+    const instruments = [];
+    
+    // Fetch ALL F&O stocks - no arbitrary limits!
+    allFnOStocks.forEach(symbol => {
+      instruments.push(`NSE:${symbol}`);
+      expiries.forEach(expiry => {
+        const futureSymbol = `NFO:${symbol}${expiry.symbol}FUT`;
+        instruments.push(futureSymbol);
+      });
+    });
+    
+    console.log(`Fetching quotes for ${instruments.length} instruments (${allFnOStocks.length} stocks × ${expiries.length} expiries + spot prices)`);
+    
+    // Batch the requests to avoid rate limits - fetch in chunks
+    let quotes = {};
+    const batchSize = 500; // Kite allows up to 500 instruments per call
+    
+    for (let i = 0; i < instruments.length; i += batchSize) {
+      const batch = instruments.slice(i, Math.min(i + batchSize, instruments.length));
+      try {
+        const batchQuotes = await kite.getQuote(batch);
+        Object.assign(quotes, batchQuotes);
+        console.log(`Fetched batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(instruments.length/batchSize)}: ${Object.keys(batchQuotes).length} quotes`);
+      } catch (err) {
+        console.log(`Error fetching batch ${Math.floor(i/batchSize) + 1}: ${err.message}`);
+      }
+      
+      // Small delay between batches to avoid rate limiting
+      if (i + batchSize < instruments.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    console.log(`✅ Successfully fetched ${Object.keys(quotes).length} quotes out of ${instruments.length} requested`);
+    
+    // Debug: Show first few quotes
+    const sampleKeys = Object.keys(quotes).slice(0, 3);
+    sampleKeys.forEach(key => {
+      console.log(`Quote ${key}: Price=${quotes[key].last_price}, Token=${quotes[key].instrument_token}`);
+    });
+    
+    // Convert quotes to tick format and store
+    Object.keys(quotes).forEach(key => {
+      const quote = quotes[key];
+      tickData[quote.instrument_token] = {
+        instrument_token: quote.instrument_token,
+        last_price: quote.last_price,
+        volume: quote.volume,
+        buy_quantity: quote.buy_quantity,
+        sell_quantity: quote.sell_quantity,
+        last_trade_time: quote.last_trade_time,
+        exchange: key.split(':')[0],
+        tradingsymbol: key.split(':')[1]
+      };
+    });
+    
+    console.log(`✅ Updated ${Object.keys(quotes).length} quotes`);
+    console.log(`Total tickData entries after update: ${Object.keys(tickData).length}`);
+    updateArbitrageData();
+    
+  } catch (error) {
+    console.error('Error fetching quotes:', error.message);
+  }
+}
+
+// Initialize everything on server start
+async function initialize() {
+  console.log('Starting initialization...');
+  
+  const authSuccess = await initializeAuth();
+  if (!authSuccess) {
+    console.error('Failed to authenticate. Server will run but data won\'t update.');
+    isInitialized = false;
+    return;
+  }
+  
+  const instrumentsLoaded = await loadInstruments();
+  if (!instrumentsLoaded) {
+    console.error('Failed to load instruments');
+    isInitialized = false;
+    return;
+  }
+  
+  // Try to start ticker but don't fail if it doesn't work
+  const tickerStarted = await startTicker();
+  if (!tickerStarted) {
+    console.log('WebSocket ticker failed, will use HTTP quotes instead');
+  }
+  
+  isInitialized = true;
+  console.log('✅ Initialization complete');
+  
+  // Start fetching quotes periodically (once per minute)
+  setInterval(fetchQuotesPeriodically, 60000); // Every 60 seconds
+  fetchQuotesPeriodically(); // Initial fetch immediately
+}
+
+// API Endpoints
+app.get('/api/status', (req, res) => {
+  res.json({
+    authenticated: !!accessToken,
+    connected: !!ticker,
+    instrumentsLoaded: equityInstruments.length > 0,
+    dataPoints: Object.keys(tickData).length,
+    isInitialized
+  });
+});
+
+// Test endpoint to get quotes directly
+app.get('/api/test-quotes', async (req, res) => {
+  try {
+    if (!kite) {
+      return res.status(500).json({ error: 'Not authenticated' });
+    }
+    
+    // Get quotes for RELIANCE and its futures
+    const instruments = ['NSE:RELIANCE', 'NFO:RELIANCE26NOV26000CE'];
+    const quotes = await kite.getQuote(instruments);
+    
+    res.json({ quotes, tickData: Object.keys(tickData).length });
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      data: error.data 
+    });
+  }
+});
+
+app.get('/api/arbitrage/:type/:month', (req, res) => {
+  const { type, month } = req.params;
+  
+  if (type === 'normal') {
+    const filtered = month === 'all' 
+      ? arbitrageData 
+      : arbitrageData.filter(d => d.expiryType === month);
+    res.json(filtered);
+  } else if (type === 'reverse') {
+    const filtered = month === 'all' 
+      ? reverseArbitrageData 
+      : reverseArbitrageData.filter(d => d.expiryType === month);
+    res.json(filtered);
+  } else {
+    res.status(400).json({ error: 'Invalid type' });
+  }
+});
+
+app.get('/api/expiries', (req, res) => {
+  res.json(getFuturesExpiries());
+});
+
+// Serve the main page
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Serve the reverse arbitrage page
+app.get('/reverse', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'reverse.html'));
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Dashboard: http://localhost:${PORT}`);
+  
+  // Initialize after server starts
+  setTimeout(initialize, 2000);
+});

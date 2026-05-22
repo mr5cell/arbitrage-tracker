@@ -1,0 +1,16 @@
+[phases.setup]
+nixPkgs = ["nodejs", "npm", "chromium"]
+
+[phases.install]
+cmds = ["npm ci"]
+cacheDirectories = ["/app/node_modules"]
+
+[variables]
+PUPPETEER_EXECUTABLE_PATH = "/nix/store/chromium/bin/chromium"
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
+
+[phases.build]
+cmds = ["echo 'Build phase - dependencies already installed'"]
+
+[start]
+cmd = "npm start"

@@ -1,0 +1,7 @@
+{
+  "username": "YOUR_ZERODHA_USER_ID",
+  "password": "YOUR_ZERODHA_PASSWORD",
+  "totpSecret": "YOUR_TOTP_SECRET_KEY",
+  "apiKey": "YOUR_KITE_API_KEY",
+  "apiSecret": "YOUR_KITE_API_SECRET"
+}
