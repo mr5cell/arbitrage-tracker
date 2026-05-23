@@ -6,7 +6,7 @@ const KiteTicker = require('kiteconnect').KiteTicker;
 const path = require('path');
 const cors = require('cors');
 const fs = require('fs');
-const { forceLogin, getKite } = require('./kite-auto-auth');
+const { login: kiteLogin, forceLogin, getKite } = require('./kite-auto-auth');
 const timeUtils = require('./utils/timeUtils');
 const slbFetcher = require('./slb/fetcher');
 
@@ -89,6 +89,7 @@ let masterTickInterval = null;
 let lastWarmupDay = null;      // IST 'YYYY-MM-DD' — WARMUP runs at most once per calendar day.
 let warmupAttempts = 0;
 let lastWarmupAttemptAt = 0;
+let coldBootSnapshotDone = false;  // one-shot snapshot fetch when cold-booting into OFFLINE
 
 // Get futures expiry dates from actual instruments
 function getFuturesExpiries() {
@@ -593,10 +594,10 @@ async function updateArbitrageData() {
   console.log(`Charges cached: ${Object.keys(chargesCache.arbitrage).length} arbitrage, ${Object.keys(chargesCache.reverse).length} reverse`);
 }
 
-// Fetch quotes via HTTP API
+// Fetch quotes via HTTP API.
+// Called from: enterLive's quotesInterval, enterSnapshot (cold-boot one-shot).
+// No state gate — interval-management + caller's preconditions are the truth.
 async function fetchQuotesPeriodically() {
-  if (state !== 'LIVE') return; // gated: only LIVE makes Kite calls
-
   if (!kite || !isInitialized || futuresInstruments.length === 0) {
     console.log('  ❌ Skipping fetch due to missing requirements');
     return;
@@ -700,8 +701,8 @@ function computeDesiredState() {
 }
 
 // Run SLB refresh if there are expiries known.
+// No state gate — interval-management + caller controls when this runs.
 function refreshSlbNow() {
-  if (state !== 'LIVE' && state !== 'WARMUP') return;
   const months = getFuturesExpiries().map(e => e.symbol);
   if (months.length === 0) { console.log('[slb] no expiries yet, skipping refresh'); return; }
   return slbFetcher.refresh(months).catch(e => console.error('[slb] refresh failed:', e.message));
@@ -736,6 +737,30 @@ async function enterLive() {
 
   slbInterval = setInterval(refreshSlbNow, 60 * 60 * 1000);
   console.log('[scheduler] LIVE intervals started');
+}
+
+// One-shot snapshot for cold boot in OFFLINE state (weekends, post-15:30, pre-07:30).
+// Kite's Quote API returns the last-close prices off-hours, so we can populate
+// the tables without entering LIVE. Uses cached token if valid (no forced
+// Puppeteer login). Doesn't set lastWarmupDay — the next 07:30 WARMUP still fires.
+async function enterSnapshot() {
+  if (coldBootSnapshotDone) return;
+  coldBootSnapshotDone = true;
+  console.log(`[scheduler] cold-boot snapshot at ${timeUtils.getISTTime().formatted}`);
+  try {
+    const token = await kiteLogin();
+    if (!token) throw new Error('login returned no token');
+    accessToken = token;
+    kite = await getKite();
+    const ok = await loadInstruments();
+    if (!ok) throw new Error('loadInstruments failed');
+    isInitialized = true;
+    await fetchQuotesPeriodically();
+    await refreshSlbNow();
+    console.log('[scheduler] cold-boot snapshot complete, staying OFFLINE');
+  } catch (e) {
+    console.error(`[scheduler] cold-boot snapshot failed: ${e.message}`);
+  }
 }
 
 function enterWindDown() {
@@ -863,5 +888,13 @@ app.listen(PORT, async () => {
 
   // Catch up to current state immediately, then re-evaluate every minute.
   await masterTick();
+
+  // If we cold-booted into OFFLINE, do a one-shot snapshot fetch in the
+  // background so the page shows last-close data instead of empty tables.
+  // Quote API works 24/7. Skipped if WARMUP/LIVE ran (state !== OFFLINE).
+  if (state === 'OFFLINE') {
+    enterSnapshot().catch(e => console.error('[scheduler] snapshot error:', e.message));
+  }
+
   masterTickInterval = setInterval(masterTick, 60_000);
 });
