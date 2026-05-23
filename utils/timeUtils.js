@@ -1,20 +1,45 @@
 // Time utilities for NSE Auction Market hours management
 // All times are in IST (Indian Standard Time)
 
-// Get current time in IST
+// Get current time in IST.
+// Testing escape hatch: if IST_OVERRIDE is set (e.g. "2026-05-26T07:29:00"),
+// treat it as an IST clock instant and return that. Do not set in production.
 function getISTTime() {
+  const override = process.env.IST_OVERRIDE;
+  if (override) {
+    const m = override.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/);
+    if (m) {
+      const [, y, mo, d, h, mi, s] = m;
+      const utcMs = Date.UTC(+y, +mo - 1, +d, +h, +mi, +s || 0);
+      const istDate = new Date(utcMs);
+      return {
+        date: istDate,
+        hours: +h,
+        minutes: +mi,
+        seconds: +s || 0,
+        day: istDate.getUTCDay(),
+        dateStr: `${y}-${mo}-${d}`,
+        formatted: `${override} (IST_OVERRIDE)`,
+      };
+    }
+  }
+
   const now = new Date();
   // IST is UTC+5:30
   const istOffset = 5.5 * 60 * 60 * 1000;
   const utcTime = now.getTime() + (now.getTimezoneOffset() * 60 * 1000);
   const istTime = new Date(utcTime + istOffset);
-  
+
+  const y = istTime.getFullYear();
+  const m = String(istTime.getMonth() + 1).padStart(2, '0');
+  const d = String(istTime.getDate()).padStart(2, '0');
   return {
     date: istTime,
     hours: istTime.getHours(),
     minutes: istTime.getMinutes(),
     seconds: istTime.getSeconds(),
     day: istTime.getDay(), // 0 = Sunday, 6 = Saturday
+    dateStr: `${y}-${m}-${d}`,
     formatted: istTime.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
   };
 }

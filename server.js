@@ -6,7 +6,7 @@ const KiteTicker = require('kiteconnect').KiteTicker;
 const path = require('path');
 const cors = require('cors');
 const fs = require('fs');
-const { login: kiteLogin, getKite } = require('./kite-auto-auth');
+const { forceLogin, getKite } = require('./kite-auto-auth');
 const timeUtils = require('./utils/timeUtils');
 const slbFetcher = require('./slb/fetcher');
 
@@ -76,44 +76,19 @@ let tickData = {};
 let arbitrageData = [];
 let reverseArbitrageData = [];
 let isInitialized = false;
-let marketCheckInterval = null;
 
-// Initialize Kite authentication
-async function initializeAuth() {
-  try {
-    console.log('Initializing authentication...');
-    
-    if (!global.kiteConfig && process.env.KITE_API_KEY) {
-      global.kiteConfig = {
-        username: process.env.KITE_USERNAME,
-        password: process.env.KITE_PASSWORD,
-        totpSecret: process.env.KITE_TOTP_SECRET,
-        apiKey: process.env.KITE_API_KEY,
-        apiSecret: process.env.KITE_API_SECRET
-      };
-    }
-    
-    // Use the kiteLogin function from kite-auto-auth
-    const token = await kiteLogin();
-    
-    if (token) {
-      accessToken = token;
-      
-      // Get the authenticated KiteConnect instance from kite-auto-auth
-      kite = await getKite();
-      
-      console.log('✅ Authentication successful');
-      console.log('Access token:', token.substring(0, 10) + '...');
-      console.log('Kite instance type:', kite.constructor.name);
-      return true;
-    } else {
-      throw new Error('Authentication failed - no access token received');
-    }
-  } catch (error) {
-    console.error('❌ Authentication error:', error.message);
-    return false;
-  }
-}
+// Daily lifecycle state machine.
+// States: OFFLINE (default outside market hours / weekends),
+//         WARMUP  (07:30–08:59 IST weekdays: fresh login, instruments, one SLB fetch),
+//         LIVE    (09:00–15:29 IST weekdays: ticker + 60s quote poll + hourly SLB).
+// At 15:30 IST → OFFLINE: intervals cleared, ticker disconnected, last data frozen in memory.
+let state = 'OFFLINE';
+let quotesInterval = null;
+let slbInterval = null;
+let masterTickInterval = null;
+let lastWarmupDay = null;      // IST 'YYYY-MM-DD' — WARMUP runs at most once per calendar day.
+let warmupAttempts = 0;
+let lastWarmupAttemptAt = 0;
 
 // Get futures expiry dates from actual instruments
 function getFuturesExpiries() {
@@ -440,7 +415,10 @@ async function startTicker() {
     
     ticker.on('connect', () => {
       console.log('✅ WebSocket connected');
-      subscribeToInstruments();
+      // Gate resubscribe on state — a reconnect during WIND_DOWN must not
+      // re-subscribe and start pulling ticks after 15:30.
+      if (state === 'LIVE') subscribeToInstruments();
+      else console.log(`[scheduler] suppressing resubscribe (state=${state})`);
     });
     
     ticker.on('disconnect', () => {
@@ -617,11 +595,8 @@ async function updateArbitrageData() {
 
 // Fetch quotes via HTTP API
 async function fetchQuotesPeriodically() {
-  console.log('📊 fetchQuotesPeriodically called');
-  console.log(`  kite: ${kite ? 'available' : 'null'}`);
-  console.log(`  isInitialized: ${isInitialized}`);
-  console.log(`  futuresInstruments.length: ${futuresInstruments.length}`);
-  
+  if (state !== 'LIVE') return; // gated: only LIVE makes Kite calls
+
   if (!kite || !isInitialized || futuresInstruments.length === 0) {
     console.log('  ❌ Skipping fetch due to missing requirements');
     return;
@@ -711,48 +686,125 @@ async function fetchQuotesPeriodically() {
   }
 }
 
-// Initialize everything on server start
-async function initialize() {
-  console.log('Starting initialization...');
-  
-  const authSuccess = await initializeAuth();
-  if (!authSuccess) {
-    console.error('Failed to authenticate. Server will run but data won\'t update.');
-    isInitialized = false;
-    return;
-  }
-  
-  const instrumentsLoaded = await loadInstruments();
-  if (!instrumentsLoaded) {
-    console.error('Failed to load instruments');
-    isInitialized = false;
-    return;
-  }
-  
-  // Try to start ticker but don't fail if it doesn't work
-  const tickerStarted = await startTicker();
-  if (!tickerStarted) {
-    console.log('WebSocket ticker failed, will use HTTP quotes instead');
-  }
-  
+// ─── Daily lifecycle scheduler ────────────────────────────────────────────
+// computeDesiredState: pure function of the IST clock.
+// 07:30–08:59 WARMUP, 09:00–15:29 LIVE, else OFFLINE. Weekends always OFFLINE.
+function computeDesiredState() {
+  const ist = timeUtils.getISTTime();
+  if (!timeUtils.isWeekday()) return 'OFFLINE';
+  const mins = ist.hours * 60 + ist.minutes;
+  if (mins < 7 * 60 + 30) return 'OFFLINE';   // before 07:30
+  if (mins < 9 * 60) return 'WARMUP';         // 07:30 – 08:59
+  if (mins < 15 * 60 + 30) return 'LIVE';     // 09:00 – 15:29
+  return 'OFFLINE';                           // 15:30 onwards
+}
+
+// Run SLB refresh if there are expiries known.
+function refreshSlbNow() {
+  if (state !== 'LIVE' && state !== 'WARMUP') return;
+  const months = getFuturesExpiries().map(e => e.symbol);
+  if (months.length === 0) { console.log('[slb] no expiries yet, skipping refresh'); return; }
+  return slbFetcher.refresh(months).catch(e => console.error('[slb] refresh failed:', e.message));
+}
+
+async function enterWarmup() {
+  console.log(`[scheduler] WARMUP starting at ${timeUtils.getISTTime().formatted}`);
+  const token = await forceLogin();
+  if (!token) throw new Error('forceLogin returned no token');
+  accessToken = token;
+  kite = await getKite();
+  console.log(`[scheduler] auth ok, token=${token.substring(0, 10)}…`);
+
+  const ok = await loadInstruments();
+  if (!ok) throw new Error('loadInstruments failed');
+
+  await refreshSlbNow();
+
   isInitialized = true;
-  console.log('✅ Initialization complete');
+  lastWarmupDay = timeUtils.getISTTime().dateStr;
+  warmupAttempts = 0;
+  console.log(`[scheduler] WARMUP complete (lastWarmupDay=${lastWarmupDay})`);
+}
 
-  // Start fetching quotes periodically (once per minute)
-  setInterval(fetchQuotesPeriodically, 60000); // Every 60 seconds
-  fetchQuotesPeriodically(); // Initial fetch immediately
+async function enterLive() {
+  console.log(`[scheduler] LIVE starting at ${timeUtils.getISTTime().formatted}`);
+  const tickerOk = await startTicker();
+  if (!tickerOk) console.log('[scheduler] ticker failed; HTTP quote polling will still run');
 
-  // SLB fee refresh: once on startup, then hourly.
-  const refreshSlb = () => {
-    const months = getFuturesExpiries().map(e => e.symbol);
-    if (months.length === 0) {
-      console.log('[slb] no expiries yet, skipping refresh');
-      return;
+  quotesInterval = setInterval(fetchQuotesPeriodically, 60_000);
+  fetchQuotesPeriodically(); // first fetch immediately
+
+  slbInterval = setInterval(refreshSlbNow, 60 * 60 * 1000);
+  console.log('[scheduler] LIVE intervals started');
+}
+
+function enterWindDown() {
+  console.log(`[scheduler] WIND_DOWN at ${timeUtils.getISTTime().formatted}`);
+  if (quotesInterval) { clearInterval(quotesInterval); quotesInterval = null; }
+  if (slbInterval)    { clearInterval(slbInterval); slbInterval = null; }
+  if (ticker) {
+    try { if (typeof ticker.autoReconnect === 'function') ticker.autoReconnect(false, 0, 0); } catch {}
+    try { ticker.disconnect(); } catch {}
+    ticker = null;
+  }
+  console.log('[scheduler] wound down; serving frozen snapshot');
+}
+
+// State must be set BEFORE enter functions run, so the state-gates inside
+// fetchQuotesPeriodically / refreshSlbNow / ticker.on('connect') don't block
+// legitimate transition-time work. On failure, roll state back so the next
+// tick retries.
+async function masterTick() {
+  const desired = computeDesiredState();
+  if (desired === state) return;
+  console.log(`[scheduler] tick: ${state} → ${desired}`);
+
+  // Throttle WARMUP retries: after 3 failures in a row, back off 5 min.
+  const warmupBackedOff = warmupAttempts >= 3 && Date.now() - lastWarmupAttemptAt < 5 * 60 * 1000;
+  const todayStr = timeUtils.getISTTime().dateStr;
+
+  if (state === 'LIVE' && desired === 'OFFLINE') {
+    state = 'OFFLINE';                      // set first so on('connect') / late timers won't fire LIVE work
+    enterWindDown();
+    return;
+  }
+
+  if (desired === 'WARMUP') {
+    if (lastWarmupDay === todayStr) { state = 'WARMUP'; return; }      // already warmed today
+    if (warmupBackedOff) { console.log('[scheduler] WARMUP backoff active'); return; }
+    lastWarmupAttemptAt = Date.now();
+    const prev = state;
+    state = 'WARMUP';
+    try { await enterWarmup(); }
+    catch (e) { state = prev; warmupAttempts++; console.error(`[scheduler] WARMUP failed (attempt ${warmupAttempts}): ${e.message}`); }
+    return;
+  }
+
+  if (state === 'WARMUP' && desired === 'LIVE') {
+    state = 'LIVE';
+    try { await enterLive(); }
+    catch (e) { state = 'WARMUP'; console.error(`[scheduler] LIVE entry failed: ${e.message}`); }
+    return;
+  }
+
+  if (state === 'OFFLINE' && desired === 'LIVE') {
+    // Restart mid-LIVE: run WARMUP first if today's hasn't happened.
+    if (lastWarmupDay !== todayStr) {
+      if (warmupBackedOff) { console.log('[scheduler] WARMUP backoff active'); return; }
+      lastWarmupAttemptAt = Date.now();
+      state = 'WARMUP';
+      try { await enterWarmup(); }
+      catch (e) { state = 'OFFLINE'; warmupAttempts++; console.error(`[scheduler] WARMUP failed (attempt ${warmupAttempts}): ${e.message}`); return; }
     }
-    slbFetcher.refresh(months).catch(e => console.error('[slb] refresh failed:', e.message));
-  };
-  refreshSlb();
-  setInterval(refreshSlb, 60 * 60 * 1000);
+    state = 'LIVE';
+    try { await enterLive(); }
+    catch (e) { state = 'OFFLINE'; console.error(`[scheduler] LIVE entry failed: ${e.message}`); }
+    return;
+  }
+
+  // Catch-all (e.g. WARMUP → OFFLINE without ever going LIVE — unlikely but safe to handle)
+  console.log(`[scheduler] unhandled transition ${state} → ${desired}; updating state only`);
+  state = desired;
 }
 
 // API Endpoints
@@ -763,6 +815,11 @@ app.get('/api/status', (req, res) => {
     instrumentsLoaded: equityInstruments.length > 0,
     dataPoints: Object.keys(tickData).length,
     isInitialized,
+    state,
+    desiredState: computeDesiredState(),
+    lastWarmupDay,
+    warmupAttempts,
+    istNow: timeUtils.getISTTime().formatted,
     slb: slbFetcher.getStatus(),
   });
 });
@@ -800,10 +857,11 @@ app.get('/reverse', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 Dashboard: http://localhost:${PORT}`);
-  
-  // Initialize after server starts
-  setTimeout(initialize, 2000);
+
+  // Catch up to current state immediately, then re-evaluate every minute.
+  await masterTick();
+  masterTickInterval = setInterval(masterTick, 60_000);
 });
